@@ -1,0 +1,12 @@
+{
+  "active_params_file": "aruco_params_legacy.json",
+  "dictionary": {
+    "custom_npz": "CUSTOM_4X4_4000_FROM_DICT_4X4_1000.npz",
+    "marker_size_bits": 4,
+    "mode": "custom",
+    "predefined_dict_count": 1000
+  },
+  "legacy_params_file": "aruco_params_legacy.json",
+  "saved_params_file": "aruco_params_current.json",
+  "scan_roi_ratio": 0.14285714285714285
+}

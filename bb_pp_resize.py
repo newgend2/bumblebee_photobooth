@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import copy
+import json
 import os
 import re
 import shutil
@@ -16,16 +18,171 @@ from picamera2 import Picamera2
 DESKTOP_DIR = Path("/home/pi/Desktop")
 LOCATIONS_FILE = Path(__file__).with_name("locations.txt")
 CUSTOM_DICT_NPZ = Path(__file__).with_name("CUSTOM_4X4_4000_FROM_DICT_4X4_1000.npz")
+ARUCO_CONFIG_FILE = Path(__file__).with_name("aruco_config.json")
 TIMEZONE = "America/Los_Angeles"
 TIME_INPUT_FORMAT = "%Y-%m-%d %H-%M-%S"
 
-DICT_MODE = "custom"   # "default" or "custom"
-MARKER_SIZE_BITS = 4
-PREDEFINED_DICT_COUNT = 1000
-TUNING_PRESET = "very_small_marker"
-MANUAL_OVERRIDES = {}
 _CUSTOM_DICT_BYTES_OWNER = None
-USE_TUNED_DETECTOR_PARAMS = False
+_DETECTOR_PARAMS_SUPPORTED = None
+
+DEFAULT_DETECTOR_PARAM_VALUES = {
+    "markerBorderBits": 1,
+    "minMarkerPerimeterRate": 0.02,
+    "maxMarkerPerimeterRate": 8.0,
+    "adaptiveThreshWinSizeMin": 3,
+    "adaptiveThreshWinSizeMax": 13,
+    "adaptiveThreshWinSizeStep": 2,
+    "adaptiveThreshConstant": 7,
+    "polygonalApproxAccuracyRate": 0.2,
+    "perspectiveRemovePixelPerCell": 3,
+    "perspectiveRemoveIgnoredMarginPerCell": 0.10,
+    "cornerRefinementWinSize": 3,
+    "cornerRefinementMaxIterations": 30,
+    "cornerRefinementMinAccuracy": 0.01,
+    "errorCorrectionRate": 0.3,
+    "maxErroneousBitsInBorderRate": 0.2,
+}
+
+DEFAULT_ARUCO_CONFIG = {
+    "dictionary": {
+        "mode": "custom",
+        "custom_npz": "CUSTOM_4X4_4000_FROM_DICT_4X4_1000.npz",
+        "marker_size_bits": 4,
+        "predefined_dict_count": 1000,
+    },
+    "scan_roi_ratio": 1 / 7,
+    "active_params_file": "aruco_params_legacy.json",
+    "legacy_params_file": "aruco_params_legacy.json",
+    "saved_params_file": "aruco_params_current.json",
+}
+
+DEFAULT_ARUCO_PARAMS = {
+    "name": "legacy_opencv_default",
+    "description": (
+        "Preserves the current field behavior: OpenCV default ArUco detector "
+        "parameters, with only ROI and post-detection filters controlled here."
+    ),
+    "use_detector_params": False,
+    "filters": {
+        "min_marker_area_ratio": 0.0,
+        "max_marker_area_ratio": 1.0,
+    },
+    "detector_params": DEFAULT_DETECTOR_PARAM_VALUES,
+}
+
+TUNABLE_SETTING_SPECS = [
+    {
+        "label": "ROI ratio",
+        "path": ("config", "scan_roi_ratio"),
+        "min": 0.05,
+        "max": 1.0,
+        "step": 0.01,
+        "kind": "float",
+        "fmt": "{:.3f}",
+    },
+    {
+        "label": "Min marker area",
+        "path": ("params", "filters", "min_marker_area_ratio"),
+        "min": 0.0,
+        "max": 0.20,
+        "step": 0.0001,
+        "kind": "float",
+        "fmt": "{:.5f}",
+    },
+    {
+        "label": "Max marker area",
+        "path": ("params", "filters", "max_marker_area_ratio"),
+        "min": 0.0001,
+        "max": 1.0,
+        "step": 0.001,
+        "kind": "float",
+        "fmt": "{:.4f}",
+    },
+    {
+        "label": "Adaptive constant",
+        "path": ("params", "detector_params", "adaptiveThreshConstant"),
+        "min": 0,
+        "max": 25,
+        "step": 1,
+        "kind": "int",
+    },
+    {
+        "label": "Threshold win min",
+        "path": ("params", "detector_params", "adaptiveThreshWinSizeMin"),
+        "min": 3,
+        "max": 51,
+        "step": 2,
+        "kind": "int",
+    },
+    {
+        "label": "Threshold win max",
+        "path": ("params", "detector_params", "adaptiveThreshWinSizeMax"),
+        "min": 3,
+        "max": 101,
+        "step": 2,
+        "kind": "int",
+    },
+    {
+        "label": "Threshold win step",
+        "path": ("params", "detector_params", "adaptiveThreshWinSizeStep"),
+        "min": 1,
+        "max": 20,
+        "step": 1,
+        "kind": "int",
+    },
+    {
+        "label": "Polygon accuracy",
+        "path": ("params", "detector_params", "polygonalApproxAccuracyRate"),
+        "min": 0.01,
+        "max": 1.0,
+        "step": 0.01,
+        "kind": "float",
+        "fmt": "{:.3f}",
+    },
+    {
+        "label": "Perspective px/cell",
+        "path": ("params", "detector_params", "perspectiveRemovePixelPerCell"),
+        "min": 1,
+        "max": 16,
+        "step": 1,
+        "kind": "int",
+    },
+    {
+        "label": "Perspective margin",
+        "path": ("params", "detector_params", "perspectiveRemoveIgnoredMarginPerCell"),
+        "min": 0.0,
+        "max": 0.50,
+        "step": 0.01,
+        "kind": "float",
+        "fmt": "{:.3f}",
+    },
+    {
+        "label": "Error correction",
+        "path": ("params", "detector_params", "errorCorrectionRate"),
+        "min": 0.0,
+        "max": 1.0,
+        "step": 0.05,
+        "kind": "float",
+        "fmt": "{:.2f}",
+    },
+    {
+        "label": "Border error rate",
+        "path": ("params", "detector_params", "maxErroneousBitsInBorderRate"),
+        "min": 0.0,
+        "max": 1.0,
+        "step": 0.05,
+        "kind": "float",
+        "fmt": "{:.2f}",
+    },
+    {
+        "label": "Corner refine win",
+        "path": ("params", "detector_params", "cornerRefinementWinSize"),
+        "min": 1,
+        "max": 15,
+        "step": 1,
+        "kind": "int",
+    },
+]
 
 BEE_FILENAME_RE = re.compile(
     r"^bee-(\d+)_angle-(\d+)_date-\d{4}-\d{2}-\d{2}"
@@ -51,7 +208,8 @@ def load_predefined_dictionary(marker_size_bits, dict_count):
 
 
 def make_custom_dictionary(bytes_list, marker_size, max_correction_bits):
-    dict_name = f"DICT_{marker_size}X{marker_size}_{PREDEFINED_DICT_COUNT}"
+    predefined_count = DEFAULT_ARUCO_CONFIG["dictionary"]["predefined_dict_count"]
+    dict_name = f"DICT_{marker_size}X{marker_size}_{predefined_count}"
     if hasattr(cv2.aruco, dict_name):
         dict_id = getattr(cv2.aruco, dict_name)
         if hasattr(cv2.aruco, "getPredefinedDictionary"):
@@ -69,6 +227,92 @@ def make_custom_dictionary(bytes_list, marker_size, max_correction_bits):
     except AttributeError:
         pass
     return aruco_dict
+
+
+def read_json(path):
+    with Path(path).open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_json(path, data):
+    with Path(path).open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+
+def repo_path(path_text):
+    return Path(__file__).with_name(path_text)
+
+
+def deep_merge(default, loaded):
+    merged = copy.deepcopy(default)
+    for key, value in loaded.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def ensure_aruco_config_files():
+    legacy_path = repo_path(DEFAULT_ARUCO_CONFIG["legacy_params_file"])
+    saved_path = repo_path(DEFAULT_ARUCO_CONFIG["saved_params_file"])
+
+    if not ARUCO_CONFIG_FILE.exists():
+        write_json(ARUCO_CONFIG_FILE, DEFAULT_ARUCO_CONFIG)
+
+    if not legacy_path.exists():
+        write_json(legacy_path, DEFAULT_ARUCO_PARAMS)
+
+    if not saved_path.exists():
+        saved_params = copy.deepcopy(DEFAULT_ARUCO_PARAMS)
+        saved_params["name"] = "current_tuned"
+        saved_params["description"] = "Editable tuned ArUco settings."
+        write_json(saved_path, saved_params)
+
+
+def load_aruco_settings():
+    ensure_aruco_config_files()
+    config = deep_merge(DEFAULT_ARUCO_CONFIG, read_json(ARUCO_CONFIG_FILE))
+    params_path = repo_path(config["active_params_file"])
+
+    if not params_path.exists():
+        print(f"[WARN] Missing active ArUco params file: {params_path}")
+        params_path = repo_path(config["legacy_params_file"])
+        config["active_params_file"] = config["legacy_params_file"]
+
+    params = deep_merge(DEFAULT_ARUCO_PARAMS, read_json(params_path))
+    return {
+        "config": config,
+        "params": params,
+        "params_path": params_path,
+    }
+
+
+def save_aruco_settings(scanner_settings, use_saved_params_file=True):
+    config = scanner_settings["config"]
+    params = scanner_settings["params"]
+
+    if use_saved_params_file:
+        params_file = config["saved_params_file"]
+        params["name"] = "current_tuned"
+        config["active_params_file"] = params_file
+    else:
+        params_file = config["active_params_file"]
+
+    params_path = repo_path(params_file)
+    write_json(params_path, params)
+    write_json(ARUCO_CONFIG_FILE, config)
+    scanner_settings["params_path"] = params_path
+
+
+def load_legacy_aruco_settings(scanner_settings):
+    legacy_file = scanner_settings["config"]["legacy_params_file"]
+    legacy_path = repo_path(legacy_file)
+    scanner_settings["params"] = deep_merge(DEFAULT_ARUCO_PARAMS, read_json(legacy_path))
+    scanner_settings["config"]["active_params_file"] = legacy_file
+    scanner_settings["params_path"] = legacy_path
+    write_json(ARUCO_CONFIG_FILE, scanner_settings["config"])
 
 
 def load_custom_dictionary(npz_path):
@@ -89,58 +333,51 @@ def load_custom_dictionary(npz_path):
     return aruco_dict, npz_path.stem
 
 
-def load_dictionary():
-    if DICT_MODE == "default":
-        return load_predefined_dictionary(MARKER_SIZE_BITS, PREDEFINED_DICT_COUNT)
-    if DICT_MODE == "custom":
-        return load_custom_dictionary(CUSTOM_DICT_NPZ)
-    raise ValueError("DICT_MODE must be 'default' or 'custom'")
+def load_dictionary(aruco_config):
+    dictionary_config = aruco_config.get("dictionary", {})
+    dict_mode = dictionary_config.get("mode", "custom")
+    marker_size_bits = int(dictionary_config.get("marker_size_bits", 4))
+    predefined_count = int(dictionary_config.get("predefined_dict_count", 1000))
+
+    if dict_mode == "default":
+        return load_predefined_dictionary(marker_size_bits, predefined_count)
+    if dict_mode == "custom":
+        custom_npz = dictionary_config.get("custom_npz", CUSTOM_DICT_NPZ.name)
+        return load_custom_dictionary(repo_path(custom_npz))
+    raise ValueError("dictionary mode must be 'default' or 'custom'")
 
 
-def make_detector_params():
+def detector_params_supported():
+    global _DETECTOR_PARAMS_SUPPORTED
+
+    if _DETECTOR_PARAMS_SUPPORTED is not None:
+        return _DETECTOR_PARAMS_SUPPORTED
+
+    code = (
+        "import cv2\n"
+        "p = cv2.aruco.DetectorParameters_create() "
+        "if hasattr(cv2.aruco, 'DetectorParameters_create') "
+        "else cv2.aruco.DetectorParameters()\n"
+        "print('ok')\n"
+    )
+    result = subprocess.run(
+        [shutil.which("python3") or "python3", "-c", code],
+        text=True,
+        capture_output=True,
+    )
+    _DETECTOR_PARAMS_SUPPORTED = result.returncode == 0
+    return _DETECTOR_PARAMS_SUPPORTED
+
+
+def make_detector_params_from_values(values):
     if hasattr(cv2.aruco, "DetectorParameters_create"):
         p = cv2.aruco.DetectorParameters_create()
     else:
         p = cv2.aruco.DetectorParameters()
 
-    p.markerBorderBits = 1
+    p.cornerRefinementMethod = getattr(cv2.aruco, "CORNER_REFINE_SUBPIX", 1)
 
-    if TUNING_PRESET == "default":
-        pass
-    elif TUNING_PRESET == "small_marker":
-        p.minMarkerPerimeterRate = 0.1
-        p.maxMarkerPerimeterRate = 5.0
-        p.adaptiveThreshWinSizeMin = 3
-        p.adaptiveThreshWinSizeMax = 23
-        p.adaptiveThreshWinSizeStep = 2
-        p.adaptiveThreshConstant = 7
-        p.polygonalApproxAccuracyRate = 0.7
-        p.perspectiveRemovePixelPerCell = 8
-        p.perspectiveRemoveIgnoredMarginPerCell = 0.13
-        p.cornerRefinementMethod = getattr(cv2.aruco, "CORNER_REFINE_SUBPIX", 1)
-        p.cornerRefinementWinSize = 5
-        p.cornerRefinementMaxIterations = 50
-        p.cornerRefinementMinAccuracy = 0.01
-    elif TUNING_PRESET == "very_small_marker":
-        p.minMarkerPerimeterRate = 0.02
-        p.maxMarkerPerimeterRate = 8.0
-        p.adaptiveThreshWinSizeMin = 3
-        p.adaptiveThreshWinSizeMax = 13
-        p.adaptiveThreshWinSizeStep = 2
-        p.adaptiveThreshConstant = 7
-        p.polygonalApproxAccuracyRate = 0.2
-        p.perspectiveRemovePixelPerCell = 3
-        p.perspectiveRemoveIgnoredMarginPerCell = 0.10
-        p.cornerRefinementMethod = getattr(cv2.aruco, "CORNER_REFINE_SUBPIX", 1)
-        p.cornerRefinementWinSize = 3
-        p.cornerRefinementMaxIterations = 30
-        p.cornerRefinementMinAccuracy = 0.01
-        p.errorCorrectionRate = 0.3
-        p.maxErroneousBitsInBorderRate = 0.2
-    else:
-        raise ValueError(f"Unknown TUNING_PRESET: {TUNING_PRESET!r}")
-
-    for k, v in MANUAL_OVERRIDES.items():
+    for k, v in values.items():
         if not hasattr(p, k):
             print(f"[WARN] DetectorParameters has no attribute '{k}', skipping")
             continue
@@ -149,8 +386,76 @@ def make_detector_params():
     return p
 
 
-def run_detection(frame, aruco_dict, detector_params, color_code=cv2.COLOR_RGB2GRAY):
-    gray = cv2.cvtColor(frame, color_code)
+def make_detector_params_for_settings(scanner_settings):
+    if not scanner_settings["params"].get("use_detector_params", False):
+        return None
+
+    if not detector_params_supported():
+        print("[WARN] OpenCV detector params failed smoke test; using defaults.")
+        scanner_settings["params"]["use_detector_params"] = False
+        return None
+
+    values = scanner_settings["params"].get("detector_params", {})
+    values = deep_merge(DEFAULT_DETECTOR_PARAM_VALUES, values)
+    scanner_settings["params"]["detector_params"] = values
+    return make_detector_params_from_values(values)
+
+
+def scan_roi_rect(frame_shape, scanner_settings):
+    h, w = frame_shape[:2]
+    ratio = float(scanner_settings["config"].get("scan_roi_ratio", 1 / 7))
+    ratio = max(0.01, min(1.0, ratio))
+    side = max(8, int(min(w, h) * ratio))
+    x1 = max(0, (w - side) // 2)
+    y1 = max(0, (h - side) // 2)
+    x2 = min(w, x1 + side)
+    y2 = min(h, y1 + side)
+    return x1, y1, x2, y2
+
+
+def shift_corners(corners, dx, dy):
+    shifted = []
+    offset = np.array([dx, dy], dtype=np.float32)
+    for marker_corners in corners:
+        shifted.append(marker_corners + offset)
+    return shifted
+
+
+def marker_area_ratio(marker_corners, frame_shape):
+    h, w = frame_shape[:2]
+    area = cv2.contourArea(marker_corners.reshape((4, 2)).astype(np.float32))
+    return area / max(1, w * h)
+
+
+def apply_marker_area_filters(corners, ids, scanner_settings, frame_shape):
+    filters = scanner_settings["params"].get("filters", {})
+    min_area = float(filters.get("min_marker_area_ratio", 0.0))
+    max_area = float(filters.get("max_marker_area_ratio", 1.0))
+
+    if not ids:
+        return corners, ids
+
+    kept = []
+    kept_ids = []
+    for marker_id, marker_corners in zip(ids, corners):
+        area_ratio = marker_area_ratio(marker_corners, frame_shape)
+        if min_area <= area_ratio <= max_area:
+            kept.append(marker_corners)
+            kept_ids.append(marker_id)
+
+    return kept, kept_ids
+
+
+def run_detection(
+    frame,
+    aruco_dict,
+    detector_params,
+    scanner_settings,
+    color_code=cv2.COLOR_RGB2GRAY,
+):
+    x1, y1, x2, y2 = scan_roi_rect(frame.shape, scanner_settings)
+    detection_frame = frame[y1:y2, x1:x2]
+    gray = cv2.cvtColor(detection_frame, color_code)
 
     if detector_params is None:
         corners, ids_raw, rejected = cv2.aruco.detectMarkers(gray, aruco_dict)
@@ -168,6 +473,10 @@ def run_detection(frame, aruco_dict, detector_params, color_code=cv2.COLOR_RGB2G
         corners = [p[1] for p in pairs]
     else:
         ids = []
+
+    corners = shift_corners(corners, x1, y1)
+    rejected = shift_corners(rejected, x1, y1)
+    corners, ids = apply_marker_area_filters(corners, ids, scanner_settings, frame.shape)
 
     return corners, ids, rejected
 
@@ -215,6 +524,52 @@ def draw_aruco_overlay(frame, corners, ids):
     return overlay
 
 
+def draw_scan_roi_overlay(img, scanner_settings, alpha=0.16):
+    x1, y1, x2, y2 = scan_roi_rect(img.shape, scanner_settings)
+    out = img.copy()
+    overlay = out.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 0), cv2.FILLED)
+    out = cv2.addWeighted(overlay, alpha, out, 1 - alpha, 0)
+    cv2.rectangle(out, (x1, y1), (x2, y2), (0, 210, 0), 2)
+    return out
+
+
+def draw_area_filter_guides(img, scanner_settings):
+    filters = scanner_settings["params"].get("filters", {})
+    min_area = float(filters.get("min_marker_area_ratio", 0.0))
+    max_area = float(filters.get("max_marker_area_ratio", 1.0))
+    h, w = img.shape[:2]
+    frame_area = w * h
+    cx, cy = w // 2, h // 2
+
+    out = img.copy()
+    for area_ratio, color, label in (
+        (max_area, (255, 180, 0), "max"),
+        (min_area, (0, 0, 255), "min"),
+    ):
+        if area_ratio <= 0 or area_ratio >= 1:
+            continue
+        side = int(np.sqrt(area_ratio * frame_area))
+        side = max(2, min(side, min(w, h)))
+        x1 = max(0, cx - side // 2)
+        y1 = max(0, cy - side // 2)
+        x2 = min(w - 1, x1 + side)
+        y2 = min(h - 1, y1 + side)
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 1)
+        cv2.putText(
+            out,
+            label,
+            (x1, max(15, y1 - 4)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
+    return out
+
+
 def draw_zoom_inset(img, crop_w=80, crop_h=80, inset_x=10, inset_y=10):
     h, w = img.shape[:2]
     cx, cy = w // 2, h // 2
@@ -250,6 +605,7 @@ def draw_text_box(
     position="top_right",
     scale=0.7,
     thickness=2,
+    background_alpha=1.0,
 ):
     disp = img.copy()
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -277,7 +633,13 @@ def draw_text_box(
     x2 = min(x1 + box_w, w - 10)
     y2 = min(y1 + box_h, h - 10)
 
-    cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 0, 0), cv2.FILLED)
+    background_alpha = max(0.0, min(1.0, background_alpha))
+    if background_alpha >= 1.0:
+        cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 0, 0), cv2.FILLED)
+    elif background_alpha > 0.0:
+        overlay = disp.copy()
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 0), cv2.FILLED)
+        disp = cv2.addWeighted(overlay, background_alpha, disp, 1 - background_alpha, 0)
 
     y = y1 + pad
     for line, (tw, th) in zip(text_lines, sizes):
@@ -297,6 +659,174 @@ def fit_image_for_display(img, max_size):
     new_w = max(1, int(img.shape[1] * scale))
     new_h = max(1, int(img.shape[0] * scale))
     return cv2.resize(img, (new_w, new_h))
+
+
+def get_nested_value(root, path):
+    current = root
+    for key in path:
+        current = current[key]
+    return current
+
+
+def set_nested_value(root, path, value):
+    current = root
+    for key in path[:-1]:
+        current = current.setdefault(key, {})
+    current[path[-1]] = value
+
+
+def format_tunable_value(value, spec):
+    if "fmt" in spec:
+        return spec["fmt"].format(value)
+    return str(value)
+
+
+def tunable_value(scanner_settings, spec):
+    scope = spec["path"][0]
+    path = spec["path"][1:]
+    return get_nested_value(scanner_settings[scope], path)
+
+
+def set_tunable_value(scanner_settings, spec, value):
+    scope = spec["path"][0]
+    path = spec["path"][1:]
+    set_nested_value(scanner_settings[scope], path, value)
+
+
+def adjust_tunable_setting(scanner_settings, spec, direction):
+    value = tunable_value(scanner_settings, spec)
+    new_value = value + spec["step"] * direction
+    new_value = max(spec["min"], min(spec["max"], new_value))
+
+    if spec["kind"] == "int":
+        new_value = int(round(new_value))
+    else:
+        new_value = round(float(new_value), 6)
+
+    set_tunable_value(scanner_settings, spec, new_value)
+
+
+def tuning_bar(value, spec, width=14):
+    span = spec["max"] - spec["min"]
+    if span <= 0:
+        filled = 0
+    else:
+        filled = int(round(((value - spec["min"]) / span) * width))
+    filled = max(0, min(width, filled))
+    return "[" + ("#" * filled) + ("-" * (width - filled)) + "]"
+
+
+def tuning_panel_lines(scanner_settings, selected_idx, ids, message):
+    params_enabled = scanner_settings["params"].get("use_detector_params", False)
+    active_file = scanner_settings["config"].get("active_params_file", "unknown")
+    lines = [
+        "ARUCO TUNING MODE",
+        f"IDs: {', '.join(str(i) for i in ids) if ids else 'none'}",
+        f"OpenCV detector params: {'on' if params_enabled else 'off'}",
+        f"Active: {active_file}",
+    ]
+
+    start = max(0, selected_idx - 3)
+    end = min(len(TUNABLE_SETTING_SPECS), start + 7)
+    start = max(0, end - 7)
+
+    for idx in range(start, end):
+        spec = TUNABLE_SETTING_SPECS[idx]
+        value = tunable_value(scanner_settings, spec)
+        prefix = ">" if idx == selected_idx else " "
+        lines.append(
+            f"{prefix} {spec['label']}: {format_tunable_value(value, spec)} "
+            f"{tuning_bar(value, spec)}"
+        )
+
+    lines.extend([
+        "+/- adjust  n/p select  u toggle detector",
+        "s save tuned  l legacy  t/esc exit",
+    ])
+    if message:
+        lines.append(message)
+
+    return lines
+
+
+def draw_tuning_panel(img, scanner_settings, selected_idx, ids, message):
+    lines = tuning_panel_lines(scanner_settings, selected_idx, ids, message)
+    return draw_text_box(
+        img,
+        lines,
+        position="top_left",
+        scale=0.47,
+        thickness=1,
+        background_alpha=0.48,
+    )
+
+
+def refresh_detector_params(scanner_settings):
+    return make_detector_params_for_settings(scanner_settings)
+
+
+def run_aruco_tuning_mode(win, picam2, aruco_dict, scanner_settings, detector_params):
+    selected_idx = 0
+    message = "Tuning live preview."
+
+    while True:
+        frame = picam2.capture_array("main")
+        corners, ids, _ = run_detection(
+            frame,
+            aruco_dict,
+            detector_params,
+            scanner_settings,
+        )
+
+        display = draw_scan_roi_overlay(frame, scanner_settings, alpha=0.22)
+        display = draw_area_filter_guides(display, scanner_settings)
+        display = draw_aruco_overlay(display, corners, ids)
+        display = draw_tuning_panel(display, scanner_settings, selected_idx, ids, message)
+
+        cv2.imshow(win, display)
+        key = cv2.waitKey(1) & 0xFF
+
+        if key in (27, ord('t'), ord('q')):
+            return detector_params
+        if key in (ord('n'), ord(']')):
+            selected_idx = (selected_idx + 1) % len(TUNABLE_SETTING_SPECS)
+            message = ""
+        elif key in (ord('p'), ord('[')):
+            selected_idx = (selected_idx - 1) % len(TUNABLE_SETTING_SPECS)
+            message = ""
+        elif key in (ord('+'), ord('=')):
+            adjust_tunable_setting(
+                scanner_settings,
+                TUNABLE_SETTING_SPECS[selected_idx],
+                1,
+            )
+            detector_params = refresh_detector_params(scanner_settings)
+            message = "Adjusted up."
+        elif key == ord('-'):
+            adjust_tunable_setting(
+                scanner_settings,
+                TUNABLE_SETTING_SPECS[selected_idx],
+                -1,
+            )
+            detector_params = refresh_detector_params(scanner_settings)
+            message = "Adjusted down."
+        elif key == ord('u'):
+            currently_enabled = scanner_settings["params"].get("use_detector_params", False)
+            scanner_settings["params"]["use_detector_params"] = not currently_enabled
+            detector_params = refresh_detector_params(scanner_settings)
+            if detector_params is None:
+                scanner_settings["params"]["use_detector_params"] = False
+                message = "Detector params unavailable; using OpenCV defaults."
+            else:
+                message = "Detector params enabled."
+        elif key == ord('s'):
+            save_aruco_settings(scanner_settings, use_saved_params_file=True)
+            detector_params = refresh_detector_params(scanner_settings)
+            message = "Saved tuned settings as default."
+        elif key == ord('l'):
+            load_legacy_aruco_settings(scanner_settings)
+            detector_params = refresh_detector_params(scanner_settings)
+            message = "Loaded legacy settings."
 
 
 def load_locations():
@@ -634,16 +1164,18 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
     locked_aruco_id = None
     same_bee_mode = False
     tmp_path = Path(tempfile.gettempdir()) / f"bee_cam_capture_{os.getpid()}.jpg"
+    scanner_settings = load_aruco_settings()
 
     print("Loading ArUco dictionary...", flush=True)
-    aruco_dict, dict_label = load_dictionary()
+    aruco_dict, dict_label = load_dictionary(scanner_settings["config"])
     print(f"Dictionary: {dict_label}", flush=True)
-    if USE_TUNED_DETECTOR_PARAMS:
-        print("Creating ArUco detector parameters...", flush=True)
-        detector_params = make_detector_params()
-    else:
+    detector_params = make_detector_params_for_settings(scanner_settings)
+    if detector_params is None:
         print("Using OpenCV default ArUco detector parameters.", flush=True)
-        detector_params = None
+    else:
+        print("Using configured ArUco detector parameters.", flush=True)
+    print(f"ArUco config: {ARUCO_CONFIG_FILE}", flush=True)
+    print(f"ArUco params: {scanner_settings['params_path']}", flush=True)
     print(f"Selected location: {selected_location}", flush=True)
     print(f"Saving images under: {DESKTOP_DIR / selected_location}", flush=True)
     print("Starting camera...", flush=True)
@@ -687,13 +1219,20 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
                         "ArUco scanning paused",
                     ]
                 else:
-                    corners, ids, _ = run_detection(frame, aruco_dict, detector_params)
+                    corners, ids, _ = run_detection(
+                        frame,
+                        aruco_dict,
+                        detector_params,
+                        scanner_settings,
+                    )
                     live_aruco_id = first_aruco_id(ids)
+                    frame = draw_scan_roi_overlay(frame, scanner_settings)
                     frame = draw_aruco_overlay(frame, corners, ids)
                     preview_lines = [
                         f"Previewing bee #{bee_num}...",
                         f"Aruco ID: {aruco_id_for_display(live_aruco_id)}",
                         f"Will capture angle {angle_num}",
+                        "Press 't' to tune ArUco",
                     ]
 
                 frame = draw_zoom_inset_top_right(frame)
@@ -736,6 +1275,7 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
                             snap,
                             aruco_dict,
                             detector_params,
+                            scanner_settings,
                             color_code=cv2.COLOR_BGR2GRAY,
                         )
                         still_aruco_id = first_aruco_id(still_ids)
@@ -818,6 +1358,14 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
 
                 elif key == ord('q') or cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
                     return
+                elif key == ord('t') and not same_bee_mode:
+                    detector_params = run_aruco_tuning_mode(
+                        win,
+                        picam2,
+                        aruco_dict,
+                        scanner_settings,
+                        detector_params,
+                    )
 
     finally:
         try:

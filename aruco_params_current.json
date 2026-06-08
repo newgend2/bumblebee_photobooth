@@ -1,0 +1,26 @@
+{
+  "description": "Editable tuned ArUco settings. Press s in tuning mode to overwrite this file and make it the default.",
+  "detector_params": {
+    "adaptiveThreshConstant": 7,
+    "adaptiveThreshWinSizeMax": 13,
+    "adaptiveThreshWinSizeMin": 3,
+    "adaptiveThreshWinSizeStep": 2,
+    "cornerRefinementMaxIterations": 30,
+    "cornerRefinementMinAccuracy": 0.01,
+    "cornerRefinementWinSize": 3,
+    "errorCorrectionRate": 0.3,
+    "markerBorderBits": 1,
+    "maxErroneousBitsInBorderRate": 0.2,
+    "maxMarkerPerimeterRate": 8.0,
+    "minMarkerPerimeterRate": 0.02,
+    "perspectiveRemoveIgnoredMarginPerCell": 0.1,
+    "perspectiveRemovePixelPerCell": 3,
+    "polygonalApproxAccuracyRate": 0.2
+  },
+  "filters": {
+    "max_marker_area_ratio": 1.0,
+    "min_marker_area_ratio": 0.0
+  },
+  "name": "current_tuned",
+  "use_detector_params": false
+}
