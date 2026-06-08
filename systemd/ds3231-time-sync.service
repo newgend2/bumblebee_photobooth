@@ -1,0 +1,17 @@
+[Unit]
+Description=Sync system time with Raspberry Pi RTC and NTP
+Wants=network-online.target
+After=systemd-udev-settle.service network-online.target
+
+[Service]
+Type=oneshot
+Environment=NTP_WAIT_SECONDS=60
+Environment=NTP_POLL_SECONDS=3
+Environment=RTC_DEVICE=auto
+Environment=TIMEZONE=America/Los_Angeles
+ExecStart=/usr/local/sbin/sync_ds3231_time.sh
+TimeoutStartSec=90
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
