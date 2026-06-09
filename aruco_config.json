@@ -8,5 +8,7 @@
   },
   "legacy_params_file": "aruco_params_legacy.json",
   "saved_params_file": "aruco_params_current.json",
+  "scan_schedule": "always",
+  "scanning_enabled": true,
   "scan_roi_ratio": 0.14285714285714285
 }
