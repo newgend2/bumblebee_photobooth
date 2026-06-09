@@ -24,6 +24,7 @@ TIME_INPUT_FORMAT = "%Y-%m-%d %H-%M-%S"
 
 _CUSTOM_DICT_BYTES_OWNER = None
 _DETECTOR_PARAMS_SUPPORTED = None
+NO_SCAN_VALUE = "noscan"
 
 DEFAULT_DETECTOR_PARAM_VALUES = {
     "markerBorderBits": 1,
@@ -50,6 +51,7 @@ DEFAULT_ARUCO_CONFIG = {
         "marker_size_bits": 4,
         "predefined_dict_count": 1000,
     },
+    "scanning_enabled": True,
     "scan_roi_ratio": 1 / 7,
     "active_params_file": "aruco_params_legacy.json",
     "legacy_params_file": "aruco_params_legacy.json",
@@ -185,8 +187,10 @@ TUNABLE_SETTING_SPECS = [
 ]
 
 BEE_FILENAME_RE = re.compile(
-    r"^bee-(\d+)_angle-(\d+)_date-\d{4}-\d{2}-\d{2}"
-    r"_time-\d{2}-\d{2}-\d{2}_arucoid-(?:nocode|\d+)\.jpg$",
+    r"^bee-(?P<bee>\d+)_angle-(?P<angle>\d+)"
+    r"_date-(?P<date>\d{4}-\d{2}-\d{2})"
+    r"_time-(?P<time>\d{2}-\d{2}-\d{2})"
+    r"_arucoid-(?P<aruco>nocode|noscan|\d+)\.jpg$",
     re.IGNORECASE,
 )
 
@@ -274,6 +278,7 @@ def ensure_aruco_config_files():
 def load_aruco_settings():
     ensure_aruco_config_files()
     config = deep_merge(DEFAULT_ARUCO_CONFIG, read_json(ARUCO_CONFIG_FILE))
+    config.pop("scan_schedule", None)
     params_path = repo_path(config["active_params_file"])
 
     if not params_path.exists():
@@ -1093,11 +1098,44 @@ def get_next_bee_number(save_dir):
 
 
 def aruco_id_for_filename(aruco_id):
+    if aruco_id == NO_SCAN_VALUE:
+        return NO_SCAN_VALUE
     return str(aruco_id) if aruco_id is not None else "nocode"
 
 
 def aruco_id_for_display(aruco_id):
+    if aruco_id == NO_SCAN_VALUE:
+        return NO_SCAN_VALUE
     return str(aruco_id) if aruco_id is not None else "none"
+
+
+def aruco_scanning_enabled(scanner_settings):
+    return bool(scanner_settings["config"].get("scanning_enabled", True))
+
+
+def set_aruco_scanning_enabled(scanner_settings, enabled):
+    scanner_settings["config"]["scanning_enabled"] = bool(enabled)
+    write_json(ARUCO_CONFIG_FILE, scanner_settings["config"])
+
+
+def should_scan_for_angle(scanner_settings, angle_num, same_bee_mode, ventral_first_mode):
+    if not aruco_scanning_enabled(scanner_settings):
+        return False
+
+    if ventral_first_mode:
+        return angle_num == 2
+
+    return not same_bee_mode
+
+
+def scheduled_no_scan_value(scanner_settings, angle_num, ventral_first_mode):
+    if not aruco_scanning_enabled(scanner_settings):
+        return NO_SCAN_VALUE
+
+    if ventral_first_mode and angle_num == 1:
+        return NO_SCAN_VALUE
+
+    return None
 
 
 def make_image_filename(bee_num, angle_num, captured_at, aruco_id):
@@ -1108,6 +1146,54 @@ def make_image_filename(bee_num, angle_num, captured_at, aruco_id):
         f"bee-{bee_num}_angle-{angle_num}_date-{date_part}"
         f"_time-{time_part}_arucoid-{aruco_part}.jpg"
     )
+
+
+def is_real_aruco_id(aruco_id):
+    if aruco_id is None or aruco_id == NO_SCAN_VALUE:
+        return False
+    return str(aruco_id).isdigit()
+
+
+def filename_with_aruco_id(path, aruco_id):
+    match = BEE_FILENAME_RE.match(path.name)
+    if not match:
+        return path
+
+    return path.with_name(
+        f"bee-{match.group('bee')}_angle-{match.group('angle')}"
+        f"_date-{match.group('date')}_time-{match.group('time')}"
+        f"_arucoid-{aruco_id_for_filename(aruco_id)}.jpg"
+    )
+
+
+def rename_placeholder_aruco_files(saved_paths, bee_num, aruco_id):
+    if not is_real_aruco_id(aruco_id):
+        return {}, []
+
+    renamed = {}
+    warnings = []
+    for path in saved_paths:
+        path = Path(path)
+        match = BEE_FILENAME_RE.match(path.name)
+        if not match or int(match.group("bee")) != bee_num:
+            continue
+        if match.group("aruco").isdigit():
+            continue
+
+        new_path = filename_with_aruco_id(path, aruco_id)
+        if new_path == path:
+            continue
+        if new_path.exists():
+            warnings.append(f"Skipped rename; target exists: {new_path}")
+            continue
+        if not path.exists():
+            warnings.append(f"Skipped rename; source missing: {path}")
+            continue
+
+        path.rename(new_path)
+        renamed[path] = new_path
+
+    return renamed, warnings
 
 
 def filename_display_lines(filename, max_chars=42):
@@ -1163,6 +1249,8 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
     angle_num = 1
     locked_aruco_id = None
     same_bee_mode = False
+    ventral_first_mode = False
+    current_bee_saved_paths = []
     tmp_path = Path(tempfile.gettempdir()) / f"bee_cam_capture_{os.getpid()}.jpg"
     scanner_settings = load_aruco_settings()
 
@@ -1211,14 +1299,19 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
                 )
 
                 frame = picam2.capture_array("main")
-                if same_bee_mode:
-                    live_aruco_id = locked_aruco_id
-                    preview_lines = [
-                        f"Continuing with bee #{bee_num}, ID: {aruco_id_for_display(live_aruco_id)}",
-                        f"Will capture angle {angle_num}",
-                        "ArUco scanning paused",
-                    ]
-                else:
+                scan_this_angle = should_scan_for_angle(
+                    scanner_settings,
+                    angle_num,
+                    same_bee_mode,
+                    ventral_first_mode,
+                )
+                scheduled_value = scheduled_no_scan_value(
+                    scanner_settings,
+                    angle_num,
+                    ventral_first_mode,
+                )
+
+                if scan_this_angle:
                     corners, ids, _ = run_detection(
                         frame,
                         aruco_dict,
@@ -1228,11 +1321,56 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
                     live_aruco_id = first_aruco_id(ids)
                     frame = draw_scan_roi_overlay(frame, scanner_settings)
                     frame = draw_aruco_overlay(frame, corners, ids)
+
+                    if same_bee_mode:
+                        preview_lines = [
+                            f"Continuing with bee #{bee_num}, scanning angle {angle_num}",
+                            f"Aruco ID: {aruco_id_for_display(live_aruco_id)}",
+                            "Ventral-first dorsal scan",
+                            "Press 't' to tune ArUco",
+                        ]
+                    else:
+                        preview_lines = [
+                            f"Previewing bee #{bee_num}...",
+                            f"Aruco ID: {aruco_id_for_display(live_aruco_id)}",
+                            f"Will capture angle {angle_num}",
+                            "Press 'v' for ventral-first shot",
+                            "Press 't' to tune ArUco",
+                            "Press 'x' for no-scan mode",
+                        ]
+                elif scheduled_value == NO_SCAN_VALUE:
+                    live_aruco_id = NO_SCAN_VALUE
+                    if aruco_scanning_enabled(scanner_settings) and ventral_first_mode:
+                        preview_lines = [
+                            f"Previewing bee #{bee_num}...",
+                            f"Aruco ID: {NO_SCAN_VALUE}",
+                            f"Will capture angle {angle_num}",
+                            "Ventral shot: scanning held",
+                            "Continue same bee to scan angle 2",
+                            "Press 'v' for normal scanning",
+                        ]
+                    else:
+                        preview_lines = [
+                            f"Previewing bee #{bee_num}...",
+                            f"Aruco ID: {NO_SCAN_VALUE}",
+                            f"Will capture angle {angle_num}",
+                            "ArUco scanning disabled",
+                            "Press 'x' to enable scanning",
+                        ]
+                elif same_bee_mode:
+                    live_aruco_id = locked_aruco_id
+                    preview_lines = [
+                        f"Continuing with bee #{bee_num}, ID: {aruco_id_for_display(live_aruco_id)}",
+                        f"Will capture angle {angle_num}",
+                        "ArUco scanning paused; carrying previous ID",
+                    ]
+                else:
+                    live_aruco_id = None
                     preview_lines = [
                         f"Previewing bee #{bee_num}...",
                         f"Aruco ID: {aruco_id_for_display(live_aruco_id)}",
                         f"Will capture angle {angle_num}",
-                        "Press 't' to tune ArUco",
+                        "ArUco scanning paused",
                     ]
 
                 frame = draw_zoom_inset_top_right(frame)
@@ -1254,7 +1392,11 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
                 if key == ord('c'):
                     captured_at = datetime.now()
                     save_dir = make_save_dir(selected_location, captured_at)
-                    captured_aruco_id = locked_aruco_id if same_bee_mode else live_aruco_id
+                    captured_aruco_id = (
+                        live_aruco_id
+                        if scan_this_angle or scheduled_value == NO_SCAN_VALUE
+                        else locked_aruco_id
+                    )
 
                     if tmp_path.exists():
                         tmp_path.unlink()
@@ -1270,7 +1412,7 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
                         picam2.start()
                         continue
 
-                    if not same_bee_mode:
+                    if scan_this_angle:
                         _, still_ids, _ = run_detection(
                             snap,
                             aruco_dict,
@@ -1309,13 +1451,33 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
                             if tmp_path.exists():
                                 tmp_path.unlink()
 
+                            current_bee_saved_paths.append(final_path)
+                            renamed_paths, rename_warnings = rename_placeholder_aruco_files(
+                                current_bee_saved_paths,
+                                bee_num,
+                                captured_aruco_id,
+                            )
+                            if renamed_paths:
+                                current_bee_saved_paths = [
+                                    renamed_paths.get(path, path)
+                                    for path in current_bee_saved_paths
+                                ]
+                                for old_path, new_path in renamed_paths.items():
+                                    print(f"Renamed with ArUco ID: {old_path} -> {new_path}")
+                            for warning in rename_warnings:
+                                print(f"[WARN] {warning}")
+
                             print(f"Saved: {final_path}")
 
                             saved_lines = (
                                 ["Saved filename:"]
                                 + filename_display_lines(final_name)
-                                + [f"Take another picture of bee #{bee_num}? (y/n)"]
                             )
+                            if renamed_paths:
+                                saved_lines.append(
+                                    f"Updated {len(renamed_paths)} earlier filename(s)"
+                                )
+                            saved_lines.append(f"Take another picture of bee #{bee_num}? (y/n)")
                             confirm_img = draw_text_box(
                                 disp,
                                 saved_lines,
@@ -1335,6 +1497,8 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
                                 elif key3 == ord('n'):
                                     same_bee_mode = False
                                     locked_aruco_id = None
+                                    ventral_first_mode = False
+                                    current_bee_saved_paths = []
                                     angle_num = 1
                                     save_dir = make_save_dir(selected_location, datetime.now())
                                     bee_num = get_next_bee_number(save_dir)
@@ -1358,7 +1522,24 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
 
                 elif key == ord('q') or cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
                     return
-                elif key == ord('t') and not same_bee_mode:
+                elif key == ord('x') and not same_bee_mode:
+                    new_state = not aruco_scanning_enabled(scanner_settings)
+                    set_aruco_scanning_enabled(scanner_settings, new_state)
+                    print(f"ArUco scanning {'enabled' if new_state else 'disabled'}.")
+                elif (
+                    key == ord('v')
+                    and not same_bee_mode
+                    and angle_num == 1
+                    and aruco_scanning_enabled(scanner_settings)
+                ):
+                    ventral_first_mode = not ventral_first_mode
+                    mode = "enabled" if ventral_first_mode else "disabled"
+                    print(f"Ventral-first mode {mode} for bee #{bee_num}.")
+                elif (
+                    key == ord('t')
+                    and scan_this_angle
+                    and aruco_scanning_enabled(scanner_settings)
+                ):
                     detector_params = run_aruco_tuning_mode(
                         win,
                         picam2,
