@@ -25,50 +25,54 @@ TIME_INPUT_FORMAT = "%Y-%m-%d %H-%M-%S"
 _CUSTOM_DICT_BYTES_OWNER = None
 _DETECTOR_PARAMS_SUPPORTED = None
 NO_SCAN_VALUE = "noscan"
+TEXT_BACKGROUND_ALPHA = 0.28
 
 DEFAULT_DETECTOR_PARAM_VALUES = {
     "markerBorderBits": 1,
-    "minMarkerPerimeterRate": 0.02,
-    "maxMarkerPerimeterRate": 8.0,
-    "adaptiveThreshWinSizeMin": 3,
-    "adaptiveThreshWinSizeMax": 13,
-    "adaptiveThreshWinSizeStep": 2,
+    "minMarkerPerimeterRate": 0.03,
+    "maxMarkerPerimeterRate": 4.0,
+    "adaptiveThreshWinSizeMin": 5,
+    "adaptiveThreshWinSizeMax": 41,
+    "adaptiveThreshWinSizeStep": 4,
     "adaptiveThreshConstant": 7,
-    "polygonalApproxAccuracyRate": 0.2,
-    "perspectiveRemovePixelPerCell": 3,
-    "perspectiveRemoveIgnoredMarginPerCell": 0.10,
-    "cornerRefinementWinSize": 3,
+    "polygonalApproxAccuracyRate": 0.03,
+    "perspectiveRemovePixelPerCell": 8,
+    "perspectiveRemoveIgnoredMarginPerCell": 0.25,
+    "cornerRefinementWinSize": 5,
     "cornerRefinementMaxIterations": 30,
-    "cornerRefinementMinAccuracy": 0.01,
-    "errorCorrectionRate": 0.3,
-    "maxErroneousBitsInBorderRate": 0.2,
+    "cornerRefinementMinAccuracy": 0.1,
+    "errorCorrectionRate": 0.0,
+    "maxErroneousBitsInBorderRate": 0.3,
+    "minOtsuStdDev": 1.0,
 }
 
 DEFAULT_ARUCO_CONFIG = {
     "dictionary": {
-        "mode": "custom",
+        "mode": "default",
         "custom_npz": "CUSTOM_4X4_4000_FROM_DICT_4X4_1000.npz",
         "marker_size_bits": 4,
         "predefined_dict_count": 1000,
     },
     "scanning_enabled": True,
-    "scan_roi_ratio": 1 / 7,
-    "active_params_file": "aruco_params_legacy.json",
+    "manual_entry_enabled": True,
+    "scan_roi_ratio": 0.35,
+    "active_params_file": "aruco_params_current.json",
     "legacy_params_file": "aruco_params_legacy.json",
     "saved_params_file": "aruco_params_current.json",
 }
 
 DEFAULT_ARUCO_PARAMS = {
-    "name": "legacy_opencv_default",
+    "name": "stable_4x4_1000",
     "description": (
-        "Preserves the current field behavior: OpenCV default ArUco detector "
-        "parameters, with only ROI and post-detection filters controlled here."
+        "Stable tuned ArUco settings for the built-in DICT_4X4_1000 dictionary."
     ),
-    "use_detector_params": False,
+    "use_detector_params": True,
     "filters": {
         "min_marker_area_ratio": 0.0,
         "max_marker_area_ratio": 1.0,
     },
+    "detection_upscale_factor": 2.0,
+    "preprocess_modes": ["raw", "clahe", "clahe_sharpen"],
     "detector_params": DEFAULT_DETECTOR_PARAM_VALUES,
 }
 
@@ -145,7 +149,7 @@ TUNABLE_SETTING_SPECS = [
         "label": "Perspective px/cell",
         "path": ("params", "detector_params", "perspectiveRemovePixelPerCell"),
         "min": 1,
-        "max": 16,
+        "max": 20,
         "step": 1,
         "kind": "int",
     },
@@ -157,6 +161,15 @@ TUNABLE_SETTING_SPECS = [
         "step": 0.01,
         "kind": "float",
         "fmt": "{:.3f}",
+    },
+    {
+        "label": "Min Otsu std",
+        "path": ("params", "detector_params", "minOtsuStdDev"),
+        "min": 0.0,
+        "max": 10.0,
+        "step": 0.5,
+        "kind": "float",
+        "fmt": "{:.1f}",
     },
     {
         "label": "Error correction",
@@ -183,6 +196,15 @@ TUNABLE_SETTING_SPECS = [
         "max": 15,
         "step": 1,
         "kind": "int",
+    },
+    {
+        "label": "Detect upscale",
+        "path": ("params", "detection_upscale_factor"),
+        "min": 1.0,
+        "max": 4.0,
+        "step": 0.5,
+        "kind": "float",
+        "fmt": "{:.1f}",
     },
 ]
 
@@ -406,6 +428,79 @@ def make_detector_params_for_settings(scanner_settings):
     return make_detector_params_from_values(values)
 
 
+def detection_upscale_factor(scanner_settings):
+    factor = float(scanner_settings["params"].get("detection_upscale_factor", 1.0))
+    return max(1.0, min(4.0, factor))
+
+
+def detection_preprocess_modes(scanner_settings):
+    configured = scanner_settings["params"].get("preprocess_modes", ["raw"])
+    if isinstance(configured, str):
+        configured = [configured]
+
+    modes = []
+    for mode in configured:
+        mode = str(mode).strip().lower()
+        if mode and mode not in modes:
+            modes.append(mode)
+
+    if "raw" not in modes:
+        modes.insert(0, "raw")
+    return modes or ["raw"]
+
+
+def preprocess_detection_gray(gray, mode):
+    if mode == "raw":
+        return gray
+    if mode == "equalize":
+        return cv2.equalizeHist(gray)
+    if mode == "clahe":
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+        return clahe.apply(gray)
+    if mode == "sharpen":
+        blurred = cv2.GaussianBlur(gray, (0, 0), 1.0)
+        return cv2.addWeighted(gray, 1.8, blurred, -0.8, 0)
+    if mode == "clahe_sharpen":
+        enhanced = preprocess_detection_gray(gray, "clahe")
+        return preprocess_detection_gray(enhanced, "sharpen")
+    return gray
+
+
+def scale_detection_gray(gray, scale):
+    if scale <= 1.0:
+        return gray
+    height, width = gray.shape[:2]
+    scaled_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+    return cv2.resize(gray, scaled_size, interpolation=cv2.INTER_CUBIC)
+
+
+def unscale_corners(corners, scale):
+    if corners is None:
+        return []
+    if scale <= 1.0:
+        return list(corners)
+    return [marker_corners / scale for marker_corners in corners]
+
+
+def detect_markers_in_gray(gray, aruco_dict, detector_params):
+    if detector_params is None:
+        return cv2.aruco.detectMarkers(gray, aruco_dict)
+    if hasattr(cv2.aruco, "ArucoDetector"):
+        detector = cv2.aruco.ArucoDetector(aruco_dict, detector_params)
+        return detector.detectMarkers(gray)
+    return cv2.aruco.detectMarkers(gray, aruco_dict, parameters=detector_params)
+
+
+def normalize_detection_result(corners, ids_raw):
+    if ids_raw is None or not len(ids_raw):
+        return [], []
+
+    pairs = sorted(zip(ids_raw.flatten().tolist(), corners), key=lambda x: x[0])
+    ids = [p[0] for p in pairs]
+    corners = [p[1] for p in pairs]
+    return corners, ids
+
+
 def scan_roi_rect(frame_shape, scanner_settings):
     h, w = frame_shape[:2]
     ratio = float(scanner_settings["config"].get("scan_roi_ratio", 1 / 7))
@@ -461,33 +556,76 @@ def run_detection(
     x1, y1, x2, y2 = scan_roi_rect(frame.shape, scanner_settings)
     detection_frame = frame[y1:y2, x1:x2]
     gray = cv2.cvtColor(detection_frame, color_code)
+    scale = detection_upscale_factor(scanner_settings)
+    best_rejected = []
 
-    if detector_params is None:
-        corners, ids_raw, rejected = cv2.aruco.detectMarkers(gray, aruco_dict)
-    elif hasattr(cv2.aruco, "ArucoDetector"):
-        detector = cv2.aruco.ArucoDetector(aruco_dict, detector_params)
-        corners, ids_raw, rejected = detector.detectMarkers(gray)
-    else:
-        corners, ids_raw, rejected = cv2.aruco.detectMarkers(
-            gray, aruco_dict, parameters=detector_params
+    for mode in detection_preprocess_modes(scanner_settings):
+        prepared_gray = preprocess_detection_gray(gray, mode)
+        detect_gray = scale_detection_gray(prepared_gray, scale)
+        corners, ids_raw, rejected = detect_markers_in_gray(
+            detect_gray,
+            aruco_dict,
+            detector_params,
         )
 
-    if ids_raw is not None and len(ids_raw):
-        pairs = sorted(zip(ids_raw.flatten().tolist(), corners), key=lambda x: x[0])
-        ids = [p[0] for p in pairs]
-        corners = [p[1] for p in pairs]
-    else:
-        ids = []
+        corners = unscale_corners(corners, scale)
+        rejected = unscale_corners(rejected, scale)
+        if len(rejected) > len(best_rejected):
+            best_rejected = rejected
 
-    corners = shift_corners(corners, x1, y1)
-    rejected = shift_corners(rejected, x1, y1)
-    corners, ids = apply_marker_area_filters(corners, ids, scanner_settings, frame.shape)
+        corners, ids = normalize_detection_result(corners, ids_raw)
+        if not ids:
+            continue
 
-    return corners, ids, rejected
+        corners = shift_corners(corners, x1, y1)
+        corners, ids = apply_marker_area_filters(
+            corners,
+            ids,
+            scanner_settings,
+            frame.shape,
+        )
+        if ids:
+            rejected = shift_corners(rejected, x1, y1)
+            return corners, ids, rejected
+
+    best_rejected = shift_corners(best_rejected, x1, y1)
+    return [], [], best_rejected
 
 
 def first_aruco_id(ids):
     return ids[0] if ids else None
+
+
+def draw_translucent_rect(img, top_left, bottom_right, color, alpha):
+    alpha = max(0.0, min(1.0, alpha))
+    if alpha <= 0.0:
+        return img
+
+    x1, y1 = top_left
+    x2, y2 = bottom_right
+    h, w = img.shape[:2]
+    x1 = max(0, min(w - 1, x1))
+    y1 = max(0, min(h - 1, y1))
+    x2 = max(0, min(w - 1, x2))
+    y2 = max(0, min(h - 1, y2))
+    if x2 <= x1 or y2 <= y1:
+        return img
+
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, cv2.FILLED)
+    cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, dst=img)
+    return img
+
+
+def flip_preview_for_monitor(img):
+    return cv2.flip(img, -1)
+
+
+def flip_corners_for_monitor(corners, frame_shape):
+    h, w = frame_shape[:2]
+    offset = np.array([w - 1, h - 1], dtype=np.float32)
+    scale = np.array([-1, -1], dtype=np.float32)
+    return [marker_corners * scale + offset for marker_corners in corners]
 
 
 def draw_aruco_overlay(frame, corners, ids):
@@ -505,16 +643,16 @@ def draw_aruco_overlay(frame, corners, ids):
     for marker_id, marker_corners in zip(ids, corners):
         pts = marker_corners.reshape((4, 2)).astype(int)
         label = f"ID {marker_id}"
-        lx = int(pts[0][0])
-        ly = max(int(pts[0][1]) - 8, 20)
+        lx = int(np.min(pts[:, 0]))
+        ly = max(int(np.min(pts[:, 1])) - 8, 20)
 
         (tw, th), baseline = cv2.getTextSize(label, font, font_scale, thickness)
-        cv2.rectangle(
+        draw_translucent_rect(
             overlay,
             (lx - 2, ly - th - baseline),
             (lx + tw + 2, ly + baseline),
             (0, 0, 0),
-            cv2.FILLED,
+            TEXT_BACKGROUND_ALPHA,
         )
         cv2.putText(
             overlay,
@@ -524,6 +662,25 @@ def draw_aruco_overlay(frame, corners, ids):
             font_scale,
             (0, 255, 0),
             thickness,
+        )
+
+    return overlay
+
+
+def draw_rejected_overlay(frame, rejected):
+    overlay = frame.copy()
+    if not rejected:
+        return overlay
+
+    for marker_corners in rejected:
+        pts = marker_corners.reshape((4, 2)).astype(int)
+        cv2.polylines(
+            overlay,
+            [pts],
+            isClosed=True,
+            color=(255, 0, 255),
+            thickness=1,
+            lineType=cv2.LINE_AA,
         )
 
     return overlay
@@ -575,34 +732,6 @@ def draw_area_filter_guides(img, scanner_settings):
     return out
 
 
-def draw_zoom_inset(img, crop_w=80, crop_h=80, inset_x=10, inset_y=10):
-    h, w = img.shape[:2]
-    cx, cy = w // 2, h // 2
-
-    x1 = max(cx - crop_w // 2, 0)
-    y1 = max(cy - crop_h // 2, 0)
-    x2 = min(x1 + crop_w, w)
-    y2 = min(y1 + crop_h, h)
-
-    inset_crop = img[y1:y2, x1:x2]
-    zoomed = cv2.resize(
-        inset_crop,
-        (crop_w * 2, crop_h * 2),
-        interpolation=cv2.INTER_NEAREST
-    )
-
-    zh, zw = zoomed.shape[:2]
-    if inset_y + zh <= h and inset_x + zw <= w:
-        img[inset_y:inset_y + zh, inset_x:inset_x + zw] = zoomed
-
-    return img
-
-
-def draw_zoom_inset_top_right(img, crop_w=80, crop_h=80):
-    inset_x = max(img.shape[1] - (crop_w * 2) - 10, 10)
-    return draw_zoom_inset(img, crop_w=crop_w, crop_h=crop_h, inset_x=inset_x, inset_y=10)
-
-
 def draw_text_box(
     img,
     text_lines,
@@ -610,7 +739,7 @@ def draw_text_box(
     position="top_right",
     scale=0.7,
     thickness=2,
-    background_alpha=1.0,
+    background_alpha=TEXT_BACKGROUND_ALPHA,
 ):
     disp = img.copy()
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -639,12 +768,7 @@ def draw_text_box(
     y2 = min(y1 + box_h, h - 10)
 
     background_alpha = max(0.0, min(1.0, background_alpha))
-    if background_alpha >= 1.0:
-        cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 0, 0), cv2.FILLED)
-    elif background_alpha > 0.0:
-        overlay = disp.copy()
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 0), cv2.FILLED)
-        disp = cv2.addWeighted(overlay, background_alpha, disp, 1 - background_alpha, 0)
+    draw_translucent_rect(disp, (x1, y1), (x2, y2), (0, 0, 0), background_alpha)
 
     y = y1 + pad
     for line, (tw, th) in zip(text_lines, sizes):
@@ -721,12 +845,15 @@ def tuning_bar(value, spec, width=14):
     return "[" + ("#" * filled) + ("-" * (width - filled)) + "]"
 
 
-def tuning_panel_lines(scanner_settings, selected_idx, ids, message):
+def tuning_panel_lines(scanner_settings, selected_idx, ids, rejected_count, message):
     params_enabled = scanner_settings["params"].get("use_detector_params", False)
     active_file = scanner_settings["config"].get("active_params_file", "unknown")
+    upscale = detection_upscale_factor(scanner_settings)
     lines = [
         "ARUCO TUNING MODE",
         f"IDs: {', '.join(str(i) for i in ids) if ids else 'none'}",
+        f"Rejected candidates: {rejected_count}",
+        f"Detect upscale: {upscale:.1f}x",
         f"OpenCV detector params: {'on' if params_enabled else 'off'}",
         f"Active: {active_file}",
     ]
@@ -754,15 +881,21 @@ def tuning_panel_lines(scanner_settings, selected_idx, ids, message):
     return lines
 
 
-def draw_tuning_panel(img, scanner_settings, selected_idx, ids, message):
-    lines = tuning_panel_lines(scanner_settings, selected_idx, ids, message)
+def draw_tuning_panel(img, scanner_settings, selected_idx, ids, rejected_count, message):
+    lines = tuning_panel_lines(
+        scanner_settings,
+        selected_idx,
+        ids,
+        rejected_count,
+        message,
+    )
     return draw_text_box(
         img,
         lines,
         position="top_left",
         scale=0.47,
         thickness=1,
-        background_alpha=0.48,
+        background_alpha=TEXT_BACKGROUND_ALPHA,
     )
 
 
@@ -776,17 +909,28 @@ def run_aruco_tuning_mode(win, picam2, aruco_dict, scanner_settings, detector_pa
 
     while True:
         frame = picam2.capture_array("main")
-        corners, ids, _ = run_detection(
+        corners, ids, rejected = run_detection(
             frame,
             aruco_dict,
             detector_params,
             scanner_settings,
         )
 
-        display = draw_scan_roi_overlay(frame, scanner_settings, alpha=0.22)
+        display = flip_preview_for_monitor(frame)
+        display = draw_scan_roi_overlay(display, scanner_settings, alpha=0.22)
         display = draw_area_filter_guides(display, scanner_settings)
-        display = draw_aruco_overlay(display, corners, ids)
-        display = draw_tuning_panel(display, scanner_settings, selected_idx, ids, message)
+        display_corners = flip_corners_for_monitor(corners, frame.shape)
+        display_rejected = flip_corners_for_monitor(rejected, frame.shape)
+        display = draw_rejected_overlay(display, display_rejected)
+        display = draw_aruco_overlay(display, display_corners, ids)
+        display = draw_tuning_panel(
+            display,
+            scanner_settings,
+            selected_idx,
+            ids,
+            len(rejected),
+            message,
+        )
 
         cv2.imshow(win, display)
         key = cv2.waitKey(1) & 0xFF
@@ -1109,8 +1253,22 @@ def aruco_id_for_display(aruco_id):
     return str(aruco_id) if aruco_id is not None else "none"
 
 
+def effective_aruco_id(scanned_aruco_id, manual_aruco_id):
+    return manual_aruco_id if manual_aruco_id is not None else scanned_aruco_id
+
+
+def aruco_status_line(scanned_aruco_id, manual_aruco_id=None):
+    if manual_aruco_id is not None:
+        return f"Aruco ID: {aruco_id_for_display(manual_aruco_id)} (manual)"
+    return f"Aruco ID: {aruco_id_for_display(scanned_aruco_id)}"
+
+
 def aruco_scanning_enabled(scanner_settings):
     return bool(scanner_settings["config"].get("scanning_enabled", True))
+
+
+def manual_aruco_entry_enabled(scanner_settings):
+    return bool(scanner_settings["config"].get("manual_entry_enabled", True))
 
 
 def set_aruco_scanning_enabled(scanner_settings, enabled):
@@ -1152,6 +1310,77 @@ def is_real_aruco_id(aruco_id):
     if aruco_id is None or aruco_id == NO_SCAN_VALUE:
         return False
     return str(aruco_id).isdigit()
+
+
+def manual_aruco_prompt_entry(current_aruco_id):
+    if is_real_aruco_id(current_aruco_id):
+        return str(current_aruco_id)
+    return ""
+
+
+def manual_aruco_prompt_lines(entry, current_aruco_id, message):
+    lines = [
+        "Manual ArUco ID",
+        f"Current: {aruco_id_for_display(current_aruco_id)}",
+        f"New: {entry if entry else 'none'}",
+        "Type digits, Backspace edits",
+        "Enter saves, Esc cancels",
+    ]
+    if message:
+        lines.append(message)
+    return lines
+
+
+def prompt_manual_aruco_id(win, base_img, current_aruco_id):
+    entry = manual_aruco_prompt_entry(current_aruco_id)
+    message = ""
+
+    while True:
+        prompt_img = draw_text_box(
+            base_img,
+            manual_aruco_prompt_lines(entry, current_aruco_id, message),
+            position="top_left",
+            scale=0.55,
+            thickness=1,
+            background_alpha=0.72,
+        )
+        cv2.imshow(win, prompt_img)
+        key = cv2.waitKey(0) & 0xFF
+
+        if key in (27, ord('q')):
+            return False, current_aruco_id
+        if key in (10, 13):
+            return True, int(entry) if entry else None
+        if key in (8, 127):
+            entry = entry[:-1]
+            message = ""
+        elif ord('0') <= key <= ord('9'):
+            entry += chr(key)
+            message = ""
+        else:
+            message = "Use digits, Backspace, Enter, or Esc."
+
+
+def print_manual_aruco_update(aruco_id):
+    if aruco_id is None:
+        print("Manual ArUco ID cleared.")
+    else:
+        print(f"Manual ArUco ID set to {aruco_id}.")
+
+
+def preview_command_lines(scanner_settings):
+    if manual_aruco_entry_enabled(scanner_settings):
+        return ["Press 'c' to capture, 'm' manual ID, 'q' quit"]
+    return ["Press 'c' to capture, 'q' to quit"]
+
+
+def review_command_lines(scanner_settings):
+    if manual_aruco_entry_enabled(scanner_settings):
+        return [
+            "Press 'k' keep, 'm' manual ID",
+            "Press 'r' retake, 'q' quit",
+        ]
+    return ["Press 'k' to keep, 'r' to retake, 'q' to quit"]
 
 
 def filename_with_aruco_id(path, aruco_id):
@@ -1291,6 +1520,7 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
             picam2.start()
 
             live_aruco_id = None
+            manual_aruco_id = None
 
             # Live preview loop
             while True:
@@ -1299,6 +1529,7 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
                 )
 
                 frame = picam2.capture_array("main")
+                display_frame = flip_preview_for_monitor(frame)
                 scan_this_angle = should_scan_for_angle(
                     scanner_settings,
                     angle_num,
@@ -1319,20 +1550,21 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
                         scanner_settings,
                     )
                     live_aruco_id = first_aruco_id(ids)
-                    frame = draw_scan_roi_overlay(frame, scanner_settings)
-                    frame = draw_aruco_overlay(frame, corners, ids)
+                    display_frame = draw_scan_roi_overlay(display_frame, scanner_settings)
+                    display_corners = flip_corners_for_monitor(corners, frame.shape)
+                    display_frame = draw_aruco_overlay(display_frame, display_corners, ids)
 
                     if same_bee_mode:
                         preview_lines = [
                             f"Continuing with bee #{bee_num}, scanning angle {angle_num}",
-                            f"Aruco ID: {aruco_id_for_display(live_aruco_id)}",
+                            aruco_status_line(live_aruco_id, manual_aruco_id),
                             "Ventral-first dorsal scan",
                             "Press 't' to tune ArUco",
                         ]
                     else:
                         preview_lines = [
                             f"Previewing bee #{bee_num}...",
-                            f"Aruco ID: {aruco_id_for_display(live_aruco_id)}",
+                            aruco_status_line(live_aruco_id, manual_aruco_id),
                             f"Will capture angle {angle_num}",
                             "Press 'v' for ventral-first shot",
                             "Press 't' to tune ArUco",
@@ -1343,7 +1575,7 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
                     if aruco_scanning_enabled(scanner_settings) and ventral_first_mode:
                         preview_lines = [
                             f"Previewing bee #{bee_num}...",
-                            f"Aruco ID: {NO_SCAN_VALUE}",
+                            aruco_status_line(NO_SCAN_VALUE, manual_aruco_id),
                             f"Will capture angle {angle_num}",
                             "Ventral shot: scanning held",
                             "Continue same bee to scan angle 2",
@@ -1352,7 +1584,7 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
                     else:
                         preview_lines = [
                             f"Previewing bee #{bee_num}...",
-                            f"Aruco ID: {NO_SCAN_VALUE}",
+                            aruco_status_line(NO_SCAN_VALUE, manual_aruco_id),
                             f"Will capture angle {angle_num}",
                             "ArUco scanning disabled",
                             "Press 'x' to enable scanning",
@@ -1360,7 +1592,8 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
                 elif same_bee_mode:
                     live_aruco_id = locked_aruco_id
                     preview_lines = [
-                        f"Continuing with bee #{bee_num}, ID: {aruco_id_for_display(live_aruco_id)}",
+                        f"Continuing with bee #{bee_num}",
+                        aruco_status_line(live_aruco_id, manual_aruco_id),
                         f"Will capture angle {angle_num}",
                         "ArUco scanning paused; carrying previous ID",
                     ]
@@ -1368,21 +1601,19 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
                     live_aruco_id = None
                     preview_lines = [
                         f"Previewing bee #{bee_num}...",
-                        f"Aruco ID: {aruco_id_for_display(live_aruco_id)}",
+                        aruco_status_line(live_aruco_id, manual_aruco_id),
                         f"Will capture angle {angle_num}",
                         "ArUco scanning paused",
                     ]
 
-                frame = draw_zoom_inset_top_right(frame)
-
                 frame_disp = draw_text_box(
-                    frame,
+                    display_frame,
                     preview_lines,
                     position="top_left",
                 )
                 frame_disp = draw_text_box(
                     frame_disp,
-                    ["Press 'c' to capture, 'q' to quit"],
+                    preview_command_lines(scanner_settings),
                     bottom=True
                 )
 
@@ -1392,10 +1623,14 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
                 if key == ord('c'):
                     captured_at = datetime.now()
                     save_dir = make_save_dir(selected_location, captured_at)
-                    captured_aruco_id = (
+                    scanned_capture_aruco_id = (
                         live_aruco_id
                         if scan_this_angle or scheduled_value == NO_SCAN_VALUE
                         else locked_aruco_id
+                    )
+                    captured_aruco_id = effective_aruco_id(
+                        scanned_capture_aruco_id,
+                        manual_aruco_id,
                     )
 
                     if tmp_path.exists():
@@ -1412,7 +1647,7 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
                         picam2.start()
                         continue
 
-                    if scan_this_angle:
+                    if scan_this_angle and manual_aruco_id is None:
                         _, still_ids, _ = run_detection(
                             snap,
                             aruco_dict,
@@ -1426,10 +1661,10 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
 
                     snap_labeled = draw_capture_label(snap, bee_num, captured_aruco_id)
                     disp = fit_image_for_display(snap_labeled, preview_res)
-                    disp = draw_zoom_inset_top_right(disp)
+                    review_lines = review_command_lines(scanner_settings)
                     captured_base = draw_text_box(
                         disp,
-                        ["Press 'k' to keep, 'r' to retake, 'q' to quit"],
+                        review_lines,
                         bottom=True
                     )
 
@@ -1513,6 +1748,29 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
                                 os.remove(tmp_path)
                             break
 
+                        elif key2 == ord('m') and manual_aruco_entry_enabled(scanner_settings):
+                            changed, entered_aruco_id = prompt_manual_aruco_id(
+                                win,
+                                captured_base,
+                                captured_aruco_id,
+                            )
+                            if changed:
+                                captured_aruco_id = entered_aruco_id
+                                manual_aruco_id = entered_aruco_id
+                                print_manual_aruco_update(captured_aruco_id)
+
+                                snap_labeled = draw_capture_label(
+                                    snap,
+                                    bee_num,
+                                    captured_aruco_id,
+                                )
+                                disp = fit_image_for_display(snap_labeled, preview_res)
+                                captured_base = draw_text_box(
+                                    disp,
+                                    review_lines,
+                                    bottom=True,
+                                )
+
                         elif key2 == ord('q') or cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
                             if os.path.exists(tmp_path):
                                 os.remove(tmp_path)
@@ -1522,6 +1780,21 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
 
                 elif key == ord('q') or cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
                     return
+                elif key == ord('m') and manual_aruco_entry_enabled(scanner_settings):
+                    current_aruco_id = effective_aruco_id(
+                        live_aruco_id,
+                        manual_aruco_id,
+                    )
+                    changed, entered_aruco_id = prompt_manual_aruco_id(
+                        win,
+                        frame_disp,
+                        current_aruco_id,
+                    )
+                    if changed:
+                        manual_aruco_id = entered_aruco_id
+                        if same_bee_mode:
+                            locked_aruco_id = entered_aruco_id
+                        print_manual_aruco_update(manual_aruco_id)
                 elif key == ord('x') and not same_bee_mode:
                     new_state = not aruco_scanning_enabled(scanner_settings)
                     set_aruco_scanning_enabled(scanner_settings, new_state)

@@ -1,26 +1,33 @@
 {
-  "description": "Editable tuned ArUco settings. Press s in tuning mode to overwrite this file and make it the default.",
+  "description": "Stable tuned ArUco settings for the built-in DICT_4X4_1000 dictionary. Press s in tuning mode to overwrite this file and make it the default.",
   "detector_params": {
     "adaptiveThreshConstant": 7,
-    "adaptiveThreshWinSizeMax": 13,
-    "adaptiveThreshWinSizeMin": 3,
-    "adaptiveThreshWinSizeStep": 2,
+    "adaptiveThreshWinSizeMax": 41,
+    "adaptiveThreshWinSizeMin": 5,
+    "adaptiveThreshWinSizeStep": 4,
     "cornerRefinementMaxIterations": 30,
-    "cornerRefinementMinAccuracy": 0.01,
-    "cornerRefinementWinSize": 3,
-    "errorCorrectionRate": 0.3,
+    "cornerRefinementMinAccuracy": 0.1,
+    "cornerRefinementWinSize": 5,
+    "errorCorrectionRate": 0.0,
     "markerBorderBits": 1,
-    "maxErroneousBitsInBorderRate": 0.2,
-    "maxMarkerPerimeterRate": 8.0,
-    "minMarkerPerimeterRate": 0.02,
-    "perspectiveRemoveIgnoredMarginPerCell": 0.1,
-    "perspectiveRemovePixelPerCell": 3,
-    "polygonalApproxAccuracyRate": 0.2
+    "maxErroneousBitsInBorderRate": 0.3,
+    "maxMarkerPerimeterRate": 4.0,
+    "minOtsuStdDev": 1.0,
+    "minMarkerPerimeterRate": 0.03,
+    "perspectiveRemoveIgnoredMarginPerCell": 0.25,
+    "perspectiveRemovePixelPerCell": 8,
+    "polygonalApproxAccuracyRate": 0.03
   },
+  "detection_upscale_factor": 2.0,
   "filters": {
     "max_marker_area_ratio": 1.0,
     "min_marker_area_ratio": 0.0
   },
-  "name": "current_tuned",
-  "use_detector_params": false
+  "name": "stable_4x4_1000",
+  "preprocess_modes": [
+    "raw",
+    "clahe",
+    "clahe_sharpen"
+  ],
+  "use_detector_params": true
 }
