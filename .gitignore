@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+
+# Raw and generated image/label data
+raw_data/
+aruco_paper_pose/
+aruco_paper_seg/images/
+aruco_paper_seg/labels/
+label_studio_yolo_seg_labels/
+
+# Label Studio exports/manifests generated from local data
+label_studio_crop_tasks.json
+label_studio_*tasks*.json
+project-*-at-*.json
+
+# Training and prediction outputs
+runs/
+seg_debug_overlays/
+*_overlays/
+models/*.pt
+*.pt
+
+# Keep lightweight model docs.
+!models/README.md
