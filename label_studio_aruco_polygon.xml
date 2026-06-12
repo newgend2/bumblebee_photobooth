@@ -1,0 +1,8 @@
+<View>
+  <Header value="Draw 4-8 ordered points around the printed ArUco marker boundary. Use extra points only where an edge visibly bends."/>
+  <Image name="image" value="$image" zoom="true" zoomControl="true" rotateControl="true"/>
+
+  <PolygonLabels name="marker_polygon" toName="image" pointSize="large" opacity="0.28">
+    <Label value="aruco_paper" background="#2B7FFF"/>
+  </PolygonLabels>
+</View>

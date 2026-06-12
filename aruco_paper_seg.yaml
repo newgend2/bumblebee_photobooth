@@ -1,0 +1,7 @@
+path: aruco_paper_seg
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: aruco_paper

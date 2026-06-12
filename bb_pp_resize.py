@@ -14,6 +14,8 @@ import cv2
 import numpy as np
 from picamera2 import Picamera2
 
+from aruco_segmentation_fallback import ArucoSegmentationFallback, DEFAULT_SEGMENT_CONFIG
+
 
 DESKTOP_DIR = Path("/home/pi/Desktop")
 LOCATIONS_FILE = Path(__file__).with_name("locations.txt")
@@ -59,6 +61,7 @@ DEFAULT_ARUCO_CONFIG = {
     "active_params_file": "aruco_params_current.json",
     "legacy_params_file": "aruco_params_legacy.json",
     "saved_params_file": "aruco_params_current.json",
+    "yolo_segmentation_fallback": DEFAULT_SEGMENT_CONFIG,
 }
 
 DEFAULT_ARUCO_PARAMS = {
@@ -428,6 +431,30 @@ def make_detector_params_for_settings(scanner_settings):
     return make_detector_params_from_values(values)
 
 
+def make_segmentation_fallback_for_settings(scanner_settings, aruco_dict):
+    config = scanner_settings["config"].get("yolo_segmentation_fallback", {})
+    try:
+        fallback = ArucoSegmentationFallback(config, aruco_dict, Path(__file__).parent)
+    except Exception as exc:
+        print(f"[WARN] YOLO segmentation fallback unavailable: {exc}")
+        return None
+
+    if not fallback.enabled:
+        print("YOLO segmentation fallback disabled by config.", flush=True)
+        return None
+
+    if not fallback.load():
+        print(f"YOLO segmentation fallback unavailable: {fallback.status}", flush=True)
+        return None
+
+    print(f"YOLO segmentation fallback {fallback.status}", flush=True)
+    return fallback
+
+
+def make_learned_fallback_for_settings(scanner_settings, aruco_dict):
+    return make_segmentation_fallback_for_settings(scanner_settings, aruco_dict)
+
+
 def detection_upscale_factor(scanner_settings):
     factor = float(scanner_settings["params"].get("detection_upscale_factor", 1.0))
     return max(1.0, min(4.0, factor))
@@ -590,6 +617,38 @@ def run_detection(
 
     best_rejected = shift_corners(best_rejected, x1, y1)
     return [], [], best_rejected
+
+
+def run_detection_with_learned_fallback(
+    frame,
+    aruco_dict,
+    detector_params,
+    scanner_settings,
+    learned_fallback,
+    color_code=cv2.COLOR_RGB2GRAY,
+):
+    corners, ids, rejected = run_detection(
+        frame,
+        aruco_dict,
+        detector_params,
+        scanner_settings,
+        color_code=color_code,
+    )
+    if ids:
+        return corners, ids, rejected, "opencv"
+
+    if learned_fallback is None:
+        return corners, ids, rejected, None
+
+    result = learned_fallback.detect(
+        frame,
+        scanner_settings=scanner_settings,
+        color_code=color_code,
+    )
+    if result is None:
+        return corners, ids, rejected, None
+
+    return [result.corners], [result.marker_id], rejected, result.source
 
 
 def first_aruco_id(ids):
@@ -1241,6 +1300,22 @@ def get_next_bee_number(save_dir):
     return highest + 1
 
 
+def prompt_bee_number(save_dir):
+    suggested = get_next_bee_number(save_dir)
+    while True:
+        try:
+            value = input(f"Enter bee number [{suggested}]: ").strip()
+        except EOFError as exc:
+            raise SystemExit("Could not read a bee number from stdin.") from exc
+
+        if not value:
+            return suggested
+        if value.isdigit() and int(value) > 0:
+            return int(value)
+
+        print("Please enter a positive bee number.")
+
+
 def aruco_id_for_filename(aruco_id):
     if aruco_id == NO_SCAN_VALUE:
         return NO_SCAN_VALUE
@@ -1257,10 +1332,14 @@ def effective_aruco_id(scanned_aruco_id, manual_aruco_id):
     return manual_aruco_id if manual_aruco_id is not None else scanned_aruco_id
 
 
-def aruco_status_line(scanned_aruco_id, manual_aruco_id=None):
+def aruco_status_line(scanned_aruco_id, manual_aruco_id=None, scan_source=None):
     if manual_aruco_id is not None:
         return f"Aruco ID: {aruco_id_for_display(manual_aruco_id)} (manual)"
-    return f"Aruco ID: {aruco_id_for_display(scanned_aruco_id)}"
+
+    source_suffix = ""
+    if scan_source in ("yolo_segmentation", "yolo_segmentation_piecewise"):
+        source_suffix = " (seg)"
+    return f"Aruco ID: {aruco_id_for_display(scanned_aruco_id)}{source_suffix}"
 
 
 def aruco_scanning_enabled(scanner_settings):
@@ -1467,14 +1546,15 @@ def update_current_save_dir(location, save_dir, bee_num, same_bee_mode):
     if same_bee_mode:
         return now_dir, bee_num
 
-    return now_dir, get_next_bee_number(now_dir)
+    print(f"Date changed; saving new bee images under {now_dir}.", flush=True)
+    return now_dir, prompt_bee_number(now_dir)
 
 
 def main(preview_res=(800, 600), still_res=(4056, 3040)):
     prompt_to_set_time()
     selected_location = choose_location()
     save_dir = make_save_dir(selected_location, datetime.now())
-    bee_num = get_next_bee_number(save_dir)
+    bee_num = prompt_bee_number(save_dir)
     angle_num = 1
     locked_aruco_id = None
     same_bee_mode = False
@@ -1491,6 +1571,7 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
         print("Using OpenCV default ArUco detector parameters.", flush=True)
     else:
         print("Using configured ArUco detector parameters.", flush=True)
+    learned_fallback = make_learned_fallback_for_settings(scanner_settings, aruco_dict)
     print(f"ArUco config: {ARUCO_CONFIG_FILE}", flush=True)
     print(f"ArUco params: {scanner_settings['params_path']}", flush=True)
     print(f"Selected location: {selected_location}", flush=True)
@@ -1520,6 +1601,7 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
             picam2.start()
 
             live_aruco_id = None
+            live_aruco_source = None
             manual_aruco_id = None
 
             # Live preview loop
@@ -1543,11 +1625,12 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
                 )
 
                 if scan_this_angle:
-                    corners, ids, _ = run_detection(
+                    corners, ids, _, live_aruco_source = run_detection_with_learned_fallback(
                         frame,
                         aruco_dict,
                         detector_params,
                         scanner_settings,
+                        learned_fallback,
                     )
                     live_aruco_id = first_aruco_id(ids)
                     display_frame = draw_scan_roi_overlay(display_frame, scanner_settings)
@@ -1557,14 +1640,22 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
                     if same_bee_mode:
                         preview_lines = [
                             f"Continuing with bee #{bee_num}, scanning angle {angle_num}",
-                            aruco_status_line(live_aruco_id, manual_aruco_id),
+                            aruco_status_line(
+                                live_aruco_id,
+                                manual_aruco_id,
+                                live_aruco_source,
+                            ),
                             "Ventral-first dorsal scan",
                             "Press 't' to tune ArUco",
                         ]
                     else:
                         preview_lines = [
                             f"Previewing bee #{bee_num}...",
-                            aruco_status_line(live_aruco_id, manual_aruco_id),
+                            aruco_status_line(
+                                live_aruco_id,
+                                manual_aruco_id,
+                                live_aruco_source,
+                            ),
                             f"Will capture angle {angle_num}",
                             "Press 'v' for ventral-first shot",
                             "Press 't' to tune ArUco",
@@ -1572,6 +1663,7 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
                         ]
                 elif scheduled_value == NO_SCAN_VALUE:
                     live_aruco_id = NO_SCAN_VALUE
+                    live_aruco_source = None
                     if aruco_scanning_enabled(scanner_settings) and ventral_first_mode:
                         preview_lines = [
                             f"Previewing bee #{bee_num}...",
@@ -1591,6 +1683,7 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
                         ]
                 elif same_bee_mode:
                     live_aruco_id = locked_aruco_id
+                    live_aruco_source = None
                     preview_lines = [
                         f"Continuing with bee #{bee_num}",
                         aruco_status_line(live_aruco_id, manual_aruco_id),
@@ -1599,6 +1692,7 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
                     ]
                 else:
                     live_aruco_id = None
+                    live_aruco_source = None
                     preview_lines = [
                         f"Previewing bee #{bee_num}...",
                         aruco_status_line(live_aruco_id, manual_aruco_id),
@@ -1648,11 +1742,12 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
                         continue
 
                     if scan_this_angle and manual_aruco_id is None:
-                        _, still_ids, _ = run_detection(
+                        _, still_ids, _, _ = run_detection_with_learned_fallback(
                             snap,
                             aruco_dict,
                             detector_params,
                             scanner_settings,
+                            learned_fallback,
                             color_code=cv2.COLOR_BGR2GRAY,
                         )
                         still_aruco_id = first_aruco_id(still_ids)
@@ -1736,7 +1831,7 @@ def main(preview_res=(800, 600), still_res=(4056, 3040)):
                                     current_bee_saved_paths = []
                                     angle_num = 1
                                     save_dir = make_save_dir(selected_location, datetime.now())
-                                    bee_num = get_next_bee_number(save_dir)
+                                    bee_num = prompt_bee_number(save_dir)
                                     break
                                 elif key3 == ord('q'):
                                     return

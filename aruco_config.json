@@ -10,5 +10,29 @@
   "manual_entry_enabled": true,
   "saved_params_file": "aruco_params_current.json",
   "scanning_enabled": true,
-  "scan_roi_ratio": 0.35
+  "scan_roi_ratio": 0.35,
+  "yolo_segmentation_fallback": {
+    "allowed_id_max": 999,
+    "allowed_id_min": 0,
+    "cell_margin_ratio": 0.25,
+    "confidence_threshold": 0.45,
+    "enabled": true,
+    "imgsz": 640,
+    "marker_border_bits": 1,
+    "marker_size_bits": 4,
+    "max_border_bit_errors": 6,
+    "max_data_bit_errors": 0,
+    "min_hamming_margin": 2,
+    "min_mask_area_ratio": 0.0005,
+    "model_path": "models/aruco_paper_seg.pt",
+    "piecewise_max_border_bit_errors": 4,
+    "piecewise_max_data_bit_errors": 0,
+    "piecewise_min_hamming_margin": 3,
+    "piecewise_rectification_enabled": false,
+    "quad_approx_epsilon_max": 0.12,
+    "quad_approx_epsilon_start": 0.01,
+    "quad_search_max_vertices": 16,
+    "use_scan_roi": true,
+    "warp_pixels_per_cell": 32
+  }
 }
